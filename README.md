@@ -1,6 +1,6 @@
 # kvraft
 
-A replicated key-value store built on Raft, in Rust, built from scratch as a distributed systems learning project.
+A replicated key-value store built on Raft, in Rust, built from scratch as a distributed systems project.
 
 ## Design rule
 
@@ -14,26 +14,6 @@ network (random 1-3 tick latency, message loss, node isolation) and asserts afte
 - **State machine safety**: a committed log entry is never different on any node, ever.
 
 A failing seed replays exactly. Run `cargo test` to see it.
-
-## Status
-
-| Stage | Scope | State |
-|---|---|---|
-| 1 | Election, replication, commit, simulator, fuzz | done |
-| 2 | Durable state (WAL), crash/restart in sim, PreVote, CheckQuorum | next |
-| 3 | KV state machine, linearizable reads/writes, client request dedup | |
-| 4 | tokio + TCP transport, multi-process cluster, CLI client | |
-| 5 | Snapshots, log compaction, membership changes | |
-
-## Known gaps (deliberate, tackled in stage 2)
-
-- State is in memory only, so a "crash" cannot yet lose volatile state.
-- No PreVote: a partitioned node inflates its term and forces a re-election when it rejoins.
-- Reads are not yet linearizable.
-- The Figure 8 safety rule (commit only current-term entries by counting replicas) is implemented but **not
-  covered by any test**: deleting it does not make a test fail. See `GUIDE.md` sections 5 and 6.
-
-New here? Read `GUIDE.md` first.
 
 ## Why a no-op on election?
 
