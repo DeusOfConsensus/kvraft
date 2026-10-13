@@ -1,4 +1,4 @@
-//! Pure Raft consensus core.
+//! Raft consensus core.
 //!
 //! No sockets, no threads, no wall clock. The caller drives the node with:
 //!   * `tick()`            - one unit of logical time
@@ -9,7 +9,30 @@
 //!
 //! Because every input is explicit, a whole cluster can be simulated
 //! deterministically from a single seed (see `sim.rs`).
+//!
+//! # Durability rule
+//!
+//! `term`, `voted_for` and the log are saved through the [`Storage`] trait at
+//! the END of every public entry point (`tick`, `step`, `propose`), before it
+//! returns. Outgoing messages only leave the node through `drain_messages`,
+//! which the driver calls afterwards, so a node can never reply to (or vote
+//! for) anyone with state that a crash could still erase. Doing this at one
+//! choke point, instead of in every handler, means a forgotten save in a new
+//! handler cannot silently break safety.
+//!
+//! Hard state is saved before the log, so after a crash between the two the
+//! stored term is never older than the stored log (checked on load).
+//!
+//! # What a restart loses
+//!
+//! `commit_index`, `last_applied` and all leader/candidate bookkeeping are
+//! volatile. A restarted node comes back as a follower with `commit_index = 0`
+//! and re-learns the commit point from the leader. Consequently
+//! `drain_committed` replays the log from the start, which is correct for a
+//! state machine that also lives only in memory. (Snapshots, stage 5, will
+//! shorten that replay.)
 
+use crate::storage::{HardState, Storage};
 use std::collections::{BTreeMap, BTreeSet};
 
 pub type NodeId = u64;
@@ -32,6 +55,19 @@ pub enum Message {
         last_log_term: Term,
     },
     RequestVoteReply {
+        term: Term,
+        granted: bool,
+    },
+    /// "Would you vote for me if I started an election for `term`?"
+    /// Asking changes nothing on the receiver: no term bump, no vote cast.
+    PreVote {
+        term: Term,
+        last_log_index: Index,
+        last_log_term: Term,
+    },
+    /// When granted, `term` echoes the proposed term. When rejected, `term` is
+    /// the responder's own term, so a stale pre-candidate can learn it is behind.
+    PreVoteReply {
         term: Term,
         granted: bool,
     },
@@ -62,6 +98,8 @@ pub struct Envelope {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Role {
     Follower,
+    /// Polling for support before spending a term. Only used when `pre_vote` is on.
+    PreCandidate,
     Candidate,
     Leader,
 }
@@ -73,6 +111,13 @@ pub struct Config {
     pub heartbeat_ticks: u64,
     pub max_entries_per_append: usize,
     pub seed: u64,
+    /// Ask peers for pre-votes before incrementing the term. Stops a node that
+    /// is cut off from the cluster from inflating its term and forcing a
+    /// needless election when it rejoins.
+    pub pre_vote: bool,
+    /// A leader that has not heard from a majority within an election timeout
+    /// steps down instead of lingering as a leader that can commit nothing.
+    pub check_quorum: bool,
 }
 
 impl Default for Config {
@@ -82,6 +127,8 @@ impl Default for Config {
             heartbeat_ticks: 2,
             max_entries_per_append: 64,
             seed: 1,
+            pre_vote: true,
+            check_quorum: true,
         }
     }
 }
@@ -98,26 +145,32 @@ pub struct Committed {
     pub data: Vec<u8>,
 }
 
-pub struct Node {
+pub struct Node<S: Storage> {
     id: NodeId,
     peers: Vec<NodeId>,
     cfg: Config,
+    storage: S,
 
     role: Role,
+    // --- persistent (saved via `storage`) ---
     term: Term,
     voted_for: Option<NodeId>,
-    leader_id: Option<NodeId>,
-
     log: Vec<Entry>, // log[i-1] holds index i
+    // --- volatile ---
+    leader_id: Option<NodeId>,
     commit_index: Index,
     last_applied: Index,
 
     // leader-only
     next_index: BTreeMap<NodeId, Index>,
     match_index: BTreeMap<NodeId, Index>,
+    /// Peers that have replied since the last quorum check (CheckQuorum).
+    recent_active: BTreeSet<NodeId>,
+    check_quorum_elapsed: u64,
 
     // candidate-only
     votes: BTreeSet<NodeId>,
+    prevotes: BTreeSet<NodeId>,
 
     election_elapsed: u64,
     election_timeout: u64,
@@ -125,10 +178,25 @@ pub struct Node {
 
     rng: u64,
     outbox: Vec<Envelope>,
+
+    // what `storage` is known to hold
+    persisted_hs: HardState,
+    /// Lowest log index changed since the last save, if any.
+    log_dirty_from: Option<Index>,
 }
 
-impl Node {
-    pub fn new(id: NodeId, peers: Vec<NodeId>, cfg: Config) -> Self {
+impl<S: Storage> Node<S> {
+    /// Create a node, restoring `term`, `voted_for` and the log from `storage`.
+    /// Pass a fresh storage for a brand new node, or the surviving storage to
+    /// model a restart after a crash.
+    pub fn new(id: NodeId, peers: Vec<NodeId>, cfg: Config, mut storage: S) -> Self {
+        let (hs, log) = storage.load();
+        let last_log_term = log.last().map_or(0, |e| e.term);
+        assert!(
+            last_log_term <= hs.term,
+            "corrupt state: log holds term {last_log_term} but stored term is only {}",
+            hs.term
+        );
         let rng = (cfg.seed.wrapping_mul(0x9E37_79B9_7F4A_7C15)
             ^ id.wrapping_mul(0xBF58_476D_1CE4_E5B9))
             | 1;
@@ -136,24 +204,36 @@ impl Node {
             id,
             peers,
             cfg,
+            storage,
             role: Role::Follower,
-            term: 0,
-            voted_for: None,
+            term: hs.term,
+            voted_for: hs.voted_for,
+            log,
             leader_id: None,
-            log: Vec::new(),
             commit_index: 0,
             last_applied: 0,
             next_index: BTreeMap::new(),
             match_index: BTreeMap::new(),
+            recent_active: BTreeSet::new(),
+            check_quorum_elapsed: 0,
             votes: BTreeSet::new(),
+            prevotes: BTreeSet::new(),
             election_elapsed: 0,
             election_timeout: 0,
             heartbeat_elapsed: 0,
             rng,
             outbox: Vec::new(),
+            persisted_hs: hs,
+            log_dirty_from: None,
         };
         n.reset_election_timer();
         n
+    }
+
+    /// Consume the node and hand back its storage: this is "the process died,
+    /// the disk survived".
+    pub fn into_storage(self) -> S {
+        self.storage
     }
 
     // ---------- accessors ----------
@@ -166,6 +246,9 @@ impl Node {
     }
     pub fn term(&self) -> Term {
         self.term
+    }
+    pub fn voted_for(&self) -> Option<NodeId> {
+        self.voted_for
     }
     pub fn leader_id(&self) -> Option<NodeId> {
         self.leader_id
@@ -183,18 +266,8 @@ impl Node {
     // ---------- driving the node ----------
 
     pub fn tick(&mut self) {
-        if self.role == Role::Leader {
-            self.heartbeat_elapsed += 1;
-            if self.heartbeat_elapsed >= self.cfg.heartbeat_ticks {
-                self.heartbeat_elapsed = 0;
-                self.broadcast_append();
-            }
-        } else {
-            self.election_elapsed += 1;
-            if self.election_elapsed >= self.election_timeout {
-                self.start_election();
-            }
-        }
+        self.tick_inner();
+        self.persist();
     }
 
     pub fn propose(&mut self, data: Vec<u8>) -> Result<(Term, Index), ProposeError> {
@@ -204,13 +277,14 @@ impl Node {
                 leader_hint: self.leader_id,
             });
         }
-        self.log.push(Entry {
+        self.push_entry(Entry {
             term: self.term,
             data,
         });
         let index = self.last_index();
         self.advance_commit(); // single-node cluster commits immediately
         self.broadcast_append();
+        self.persist();
         Ok((self.term, index))
     }
 
@@ -223,6 +297,14 @@ impl Node {
             } => self.handle_request_vote(from, term, last_log_index, last_log_term),
             Message::RequestVoteReply { term, granted } => {
                 self.handle_vote_reply(from, term, granted)
+            }
+            Message::PreVote {
+                term,
+                last_log_index,
+                last_log_term,
+            } => self.handle_pre_vote(from, term, last_log_index, last_log_term),
+            Message::PreVoteReply { term, granted } => {
+                self.handle_pre_vote_reply(from, term, granted)
             }
             Message::AppendEntries {
                 term,
@@ -245,6 +327,7 @@ impl Node {
                 hint,
             } => self.handle_append_reply(from, term, success, match_index, hint),
         }
+        self.persist();
     }
 
     pub fn drain_messages(&mut self) -> Vec<Envelope> {
@@ -267,7 +350,68 @@ impl Node {
         out
     }
 
+    // ---------- persistence ----------
+
+    /// Make everything that changed since the last call durable. Called once at
+    /// the end of each public entry point, never from inside a handler.
+    fn persist(&mut self) {
+        let hs = HardState {
+            term: self.term,
+            voted_for: self.voted_for,
+        };
+        if hs != self.persisted_hs {
+            self.storage.save_hard_state(hs);
+            self.persisted_hs = hs;
+        }
+        if let Some(from) = self.log_dirty_from.take() {
+            self.storage
+                .replace_log_suffix(from, &self.log[(from - 1) as usize..]);
+        }
+    }
+
+    fn mark_log_dirty(&mut self, index: Index) {
+        self.log_dirty_from = Some(self.log_dirty_from.map_or(index, |d| d.min(index)));
+    }
+
+    fn push_entry(&mut self, e: Entry) {
+        self.log.push(e);
+        let idx = self.last_index();
+        self.mark_log_dirty(idx);
+    }
+
     // ---------- helpers ----------
+
+    fn tick_inner(&mut self) {
+        if self.role == Role::Leader {
+            if self.cfg.check_quorum {
+                self.check_quorum_elapsed += 1;
+                if self.check_quorum_elapsed >= self.cfg.election_ticks {
+                    let active = self.recent_active.len() + 1; // +1: ourselves
+                    self.recent_active.clear();
+                    self.check_quorum_elapsed = 0;
+                    if active < self.quorum() {
+                        // We can no longer commit anything. Stop pretending to lead.
+                        self.become_follower(self.term, None);
+                        return;
+                    }
+                }
+            }
+            self.heartbeat_elapsed += 1;
+            if self.heartbeat_elapsed >= self.cfg.heartbeat_ticks {
+                self.heartbeat_elapsed = 0;
+                self.broadcast_append();
+            }
+        } else {
+            self.election_elapsed += 1;
+            if self.election_elapsed >= self.election_timeout {
+                if self.cfg.pre_vote {
+                    self.start_pre_vote();
+                } else {
+                    self.start_election();
+                }
+            }
+        }
+    }
 
     fn quorum(&self) -> usize {
         let cluster_size = self.peers.len() + 1;
@@ -321,6 +465,33 @@ impl Node {
         self.reset_election_timer();
     }
 
+    /// Phase 1 of an election: poll peers WITHOUT touching `term` or `voted_for`.
+    /// Only if a majority says "yes, I would vote for you" do we spend a term.
+    fn start_pre_vote(&mut self) {
+        self.role = Role::PreCandidate;
+        self.leader_id = None;
+        self.prevotes.clear();
+        self.prevotes.insert(self.id);
+        self.reset_election_timer();
+
+        if self.prevotes.len() >= self.quorum() {
+            self.start_election();
+            return;
+        }
+        let proposed = self.term + 1;
+        let (lli, llt) = (self.last_index(), self.last_term());
+        for p in self.peers.clone() {
+            self.send(
+                p,
+                Message::PreVote {
+                    term: proposed,
+                    last_log_index: lli,
+                    last_log_term: llt,
+                },
+            );
+        }
+    }
+
     fn start_election(&mut self) {
         self.term += 1;
         self.role = Role::Candidate;
@@ -351,6 +522,8 @@ impl Node {
         self.role = Role::Leader;
         self.leader_id = Some(self.id);
         self.heartbeat_elapsed = 0;
+        self.recent_active.clear();
+        self.check_quorum_elapsed = 0;
         let next = self.last_index() + 1;
         for p in self.peers.clone() {
             self.next_index.insert(p, next);
@@ -359,7 +532,7 @@ impl Node {
         // A leader may only commit entries from its own term by counting replicas
         // (Raft paper, section 5.4.2). The no-op gives it one to commit, which
         // transitively commits everything before it.
-        self.log.push(Entry {
+        self.push_entry(Entry {
             term: self.term,
             data: Vec::new(),
         });
@@ -413,6 +586,53 @@ impl Node {
             if self.votes.len() >= self.quorum() {
                 self.become_leader();
             }
+        }
+    }
+
+    /// Answer "would you vote for me at `term`?" without changing any state.
+    fn handle_pre_vote(&mut self, from: NodeId, term: Term, lli: Index, llt: Term) {
+        // The proposed term must actually be ahead of ours.
+        if term <= self.term {
+            self.send(
+                from,
+                Message::PreVoteReply {
+                    term: self.term,
+                    granted: false,
+                },
+            );
+            return;
+        }
+        // Leader lease: if we have a working leader (or are one), refuse to help
+        // anyone start an election. This is what keeps a rejoining node from
+        // dethroning a healthy leader.
+        let has_live_leader = self.role == Role::Leader
+            || (self.leader_id.is_some() && self.election_elapsed < self.cfg.election_ticks);
+        let up_to_date = (llt, lli) >= (self.last_term(), self.last_index());
+        let grant = !has_live_leader && up_to_date;
+        self.send(
+            from,
+            Message::PreVoteReply {
+                term: if grant { term } else { self.term },
+                granted: grant,
+            },
+        );
+    }
+
+    fn handle_pre_vote_reply(&mut self, from: NodeId, term: Term, granted: bool) {
+        if !granted {
+            // A rejection carries the responder's term; if it is ahead, we are stale.
+            if term > self.term {
+                self.become_follower(term, None);
+            }
+            return;
+        }
+        // Ignore grants for a proposal that is no longer current.
+        if self.role != Role::PreCandidate || term != self.term + 1 {
+            return;
+        }
+        self.prevotes.insert(from);
+        if self.prevotes.len() >= self.quorum() {
+            self.start_election();
         }
     }
 
@@ -492,9 +712,9 @@ impl Node {
                         "must never truncate committed entries"
                     );
                     self.log.truncate((idx - 1) as usize);
-                    self.log.push(e);
+                    self.push_entry(e);
                 }
-                None => self.log.push(e),
+                None => self.push_entry(e),
             }
         }
 
@@ -527,6 +747,8 @@ impl Node {
         if self.role != Role::Leader || term < self.term {
             return;
         }
+        // Any same-term reply, success or not, proves `from` can still talk to us.
+        self.recent_active.insert(from);
         if success {
             let m = self.match_index.entry(from).or_insert(0);
             *m = (*m).max(match_index);

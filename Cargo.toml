@@ -4,3 +4,9 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+
+# The fuzz tests run millions of simulated ticks. Optimizing the test profile
+# (while keeping debug assertions and overflow checks ON) makes `cargo test`
+# several times faster without hiding any bug a debug build would catch.
+[profile.test]
+opt-level = 3
