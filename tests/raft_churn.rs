@@ -8,7 +8,7 @@
 //! just because a majority holds it. With that check deleted (and even with the
 //! leader no-op also deleted), 1500+ seeds still passed. Random fuzzing cannot
 //! steer the exact election sequence that bug needs. Covering it requires a
-//! scripted scenario with controlled elections; see GUIDE.md.
+//! scripted scenario with controlled elections
 
 use kvraft::sim::Sim;
 

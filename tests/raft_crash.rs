@@ -86,6 +86,7 @@ fn restart_from_real_wal_keeps_vote_term_and_acknowledged_entries() {
             prev_log_term: 0,
             entries: vec![e(3, b"a"), e(3, b"b")],
             leader_commit: 0,
+            round: 0,
         },
     );
     assert_eq!(
@@ -93,6 +94,7 @@ fn restart_from_real_wal_keeps_vote_term_and_acknowledged_entries() {
         Message::AppendEntriesReply {
             term: 3,
             success: true,
+            round: 0,
             match_index: 2,
             hint: 0
         }
@@ -183,6 +185,7 @@ fn crash_recovery_equivalence<S: Storage>(
                         // Kept at 0: garbage senders must not be able to "commit"
                         // entries that a later garbage sender then truncates.
                         leader_commit: 0,
+                        round: 0,
                     },
                 );
             }

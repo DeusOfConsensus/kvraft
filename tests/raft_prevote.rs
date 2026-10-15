@@ -127,6 +127,7 @@ fn follower_with_live_leader() -> Node<MemStorage> {
             prev_log_term: 0,
             entries: vec![e(2, b"x")],
             leader_commit: 0,
+            round: 0,
         },
     );
     drained(&mut n);

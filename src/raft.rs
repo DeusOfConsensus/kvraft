@@ -77,10 +77,15 @@ pub enum Message {
         prev_log_term: Term,
         entries: Vec<Entry>,
         leader_commit: Index,
+        /// ReadIndex round the leader had reached when it sent this. Followers
+        /// echo it back; see `read_index`.
+        round: u64,
     },
     AppendEntriesReply {
         term: Term,
         success: bool,
+        /// Echo of the request's `round`.
+        round: u64,
         /// On success: highest index known to match the leader.
         match_index: Index,
         /// On failure: follower's suggestion for where the leader should retry from (hint + 1).
@@ -145,6 +150,41 @@ pub struct Committed {
     pub data: Vec<u8>,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+pub enum ReadError {
+    NotLeader {
+        leader_hint: Option<NodeId>,
+    },
+    /// Leader, but it has not yet committed an entry of its own term, so its
+    /// `commit_index` may still lag the true commit point. Retry shortly.
+    NotReady,
+}
+
+/// A linearizable read the leader has confirmed: once the state machine has
+/// applied everything up to `index`, answering `id` is safe.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReadState {
+    pub id: u64,
+    pub index: Index,
+}
+
+/// The fields of an incoming `AppendEntries`, bundled for the handler.
+struct AppendReq {
+    term: Term,
+    prev_idx: Index,
+    prev_term: Term,
+    entries: Vec<Entry>,
+    leader_commit: Index,
+    round: u64,
+}
+
+struct PendingRead {
+    id: u64,
+    index: Index,
+    /// Needs a quorum to have acknowledged a heartbeat of at least this round.
+    round: u64,
+}
+
 pub struct Node<S: Storage> {
     id: NodeId,
     peers: Vec<NodeId>,
@@ -167,6 +207,12 @@ pub struct Node<S: Storage> {
     /// Peers that have replied since the last quorum check (CheckQuorum).
     recent_active: BTreeSet<NodeId>,
     check_quorum_elapsed: u64,
+    /// ReadIndex: bumped when a read arrives; stamped on every AppendEntries.
+    round: u64,
+    /// Highest round each peer has echoed back in this leadership.
+    acked_round: BTreeMap<NodeId, u64>,
+    pending_reads: Vec<PendingRead>,
+    ready_reads: Vec<ReadState>,
 
     // candidate-only
     votes: BTreeSet<NodeId>,
@@ -216,6 +262,10 @@ impl<S: Storage> Node<S> {
             match_index: BTreeMap::new(),
             recent_active: BTreeSet::new(),
             check_quorum_elapsed: 0,
+            round: 0,
+            acked_round: BTreeMap::new(),
+            pending_reads: Vec::new(),
+            ready_reads: Vec::new(),
             votes: BTreeSet::new(),
             prevotes: BTreeSet::new(),
             election_elapsed: 0,
@@ -256,6 +306,10 @@ impl<S: Storage> Node<S> {
     pub fn commit_index(&self) -> Index {
         self.commit_index
     }
+    /// Highest log index handed out by `drain_committed` so far.
+    pub fn last_applied(&self) -> Index {
+        self.last_applied
+    }
     pub fn last_index(&self) -> Index {
         self.log.len() as Index
     }
@@ -288,6 +342,46 @@ impl<S: Storage> Node<S> {
         Ok((self.term, index))
     }
 
+    /// Start a linearizable read, identified by the caller's `id`.
+    ///
+    /// ReadIndex: remember the current `commit_index`, then prove we are still
+    /// the leader by getting a quorum to acknowledge a heartbeat sent AFTER the
+    /// read arrived. (A deposed leader that has not noticed yet cannot get that
+    /// quorum, because a majority has already moved to a higher term.) The
+    /// confirmed read appears in `drain_read_states`; the caller answers it once
+    /// its state machine has applied up to the reported index.
+    ///
+    /// Nothing is written to the log, so reads cost one heartbeat round trip
+    /// and no disk write.
+    pub fn read_index(&mut self, id: u64) -> Result<(), ReadError> {
+        if self.role != Role::Leader {
+            return Err(ReadError::NotLeader {
+                leader_hint: self.leader_id,
+            });
+        }
+        // Until we commit something in our own term, commit_index may be behind
+        // writes the previous leader already acknowledged.
+        if self.term_at(self.commit_index) != Some(self.term) {
+            return Err(ReadError::NotReady);
+        }
+        self.round += 1;
+        self.pending_reads.push(PendingRead {
+            id,
+            index: self.commit_index,
+            round: self.round,
+        });
+        self.broadcast_append();
+        self.advance_reads(); // a single-node cluster is its own quorum
+        self.persist();
+        Ok(())
+    }
+
+    /// Reads confirmed since the last call. They are dropped, and never
+    /// reported, if this node loses leadership first.
+    pub fn drain_read_states(&mut self) -> Vec<ReadState> {
+        std::mem::take(&mut self.ready_reads)
+    }
+
     pub fn step(&mut self, from: NodeId, msg: Message) {
         match msg {
             Message::RequestVote {
@@ -312,20 +406,25 @@ impl<S: Storage> Node<S> {
                 prev_log_term,
                 entries,
                 leader_commit,
+                round,
             } => self.handle_append_entries(
                 from,
-                term,
-                prev_log_index,
-                prev_log_term,
-                entries,
-                leader_commit,
+                AppendReq {
+                    term,
+                    prev_idx: prev_log_index,
+                    prev_term: prev_log_term,
+                    entries,
+                    leader_commit,
+                    round,
+                },
             ),
             Message::AppendEntriesReply {
                 term,
                 success,
+                round,
                 match_index,
                 hint,
-            } => self.handle_append_reply(from, term, success, match_index, hint),
+            } => self.handle_append_reply(from, term, success, round, match_index, hint),
         }
         self.persist();
     }
@@ -462,6 +561,8 @@ impl<S: Storage> Node<S> {
         }
         self.role = Role::Follower;
         self.leader_id = leader;
+        self.pending_reads.clear();
+        self.ready_reads.clear();
         self.reset_election_timer();
     }
 
@@ -524,6 +625,10 @@ impl<S: Storage> Node<S> {
         self.heartbeat_elapsed = 0;
         self.recent_active.clear();
         self.check_quorum_elapsed = 0;
+        self.round = 0;
+        self.acked_round.clear();
+        self.pending_reads.clear();
+        self.ready_reads.clear();
         let next = self.last_index() + 1;
         for p in self.peers.clone() {
             self.next_index.insert(p, next);
@@ -659,25 +764,27 @@ impl<S: Storage> Node<S> {
                 prev_log_term: prev_term,
                 entries,
                 leader_commit: self.commit_index,
+                round: self.round,
             },
         );
     }
 
-    fn handle_append_entries(
-        &mut self,
-        from: NodeId,
-        term: Term,
-        prev_idx: Index,
-        prev_term: Term,
-        entries: Vec<Entry>,
-        leader_commit: Index,
-    ) {
+    fn handle_append_entries(&mut self, from: NodeId, req: AppendReq) {
+        let AppendReq {
+            term,
+            prev_idx,
+            prev_term,
+            entries,
+            leader_commit,
+            round,
+        } = req;
         if term < self.term {
             self.send(
                 from,
                 Message::AppendEntriesReply {
                     term: self.term,
                     success: false,
+                    round,
                     match_index: 0,
                     hint: 0,
                 },
@@ -694,6 +801,7 @@ impl<S: Storage> Node<S> {
                 Message::AppendEntriesReply {
                     term: self.term,
                     success: false,
+                    round,
                     match_index: 0,
                     hint,
                 },
@@ -726,6 +834,7 @@ impl<S: Storage> Node<S> {
             Message::AppendEntriesReply {
                 term: self.term,
                 success: true,
+                round,
                 match_index: idx,
                 hint: 0,
             },
@@ -737,6 +846,7 @@ impl<S: Storage> Node<S> {
         from: NodeId,
         term: Term,
         success: bool,
+        round: u64,
         match_index: Index,
         hint: Index,
     ) {
@@ -749,6 +859,11 @@ impl<S: Storage> Node<S> {
         }
         // Any same-term reply, success or not, proves `from` can still talk to us.
         self.recent_active.insert(from);
+        // A same-term reply also proves `from` accepted us as leader when it
+        // processed the request carrying `round`.
+        let acked = self.acked_round.entry(from).or_insert(0);
+        *acked = (*acked).max(round);
+        self.advance_reads();
         if success {
             let m = self.match_index.entry(from).or_insert(0);
             *m = (*m).max(match_index);
@@ -767,6 +882,23 @@ impl<S: Storage> Node<S> {
             self.next_index.insert(from, new_next);
             self.send_append(from);
         }
+    }
+
+    /// Promote pending reads whose round a quorum has acknowledged.
+    fn advance_reads(&mut self) {
+        let quorum = self.quorum();
+        let acked = &self.acked_round;
+        let ready = &mut self.ready_reads;
+        self.pending_reads.retain(|r| {
+            let confirmed = 1 + acked.values().filter(|&&a| a >= r.round).count() >= quorum;
+            if confirmed {
+                ready.push(ReadState {
+                    id: r.id,
+                    index: r.index,
+                });
+            }
+            !confirmed
+        });
     }
 
     /// Advance commit_index to the highest index replicated on a quorum whose
