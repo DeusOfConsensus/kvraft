@@ -4,6 +4,9 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+# Stage 4 is the first stage with a dependency: the async runtime for the network
+# driver. The Raft core, state machine, simulators and checker still use only std.
+tokio = { version = "1", features = ["rt", "net", "time", "sync", "macros", "io-util"] }
 
 # The fuzz tests run millions of simulated ticks. Optimizing the test profile
 # (while keeping debug assertions and overflow checks ON) makes `cargo test`
